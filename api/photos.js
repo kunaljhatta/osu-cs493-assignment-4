@@ -3,28 +3,57 @@
  */
 
 const { Router } = require('express')
-
+const { getChannel, connectToRabbitMQ } = require('../lib/rabbitmq')
 const { validateAgainstSchema } = require('../lib/validation')
+
 const {
   PhotoSchema,
-  insertNewPhoto,
-  getPhotoById
+  photoTypes,
+  getPhotoInfoById,
+  savePhotoFile,
+  removeUploadedFile,
 } = require('../models/photo')
 
 const router = Router()
+const multer = require('multer');
+const crypto = require("node:crypto")
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: `${__dirname}/../uploads`,
+    filename: (req, file, callback) => {
+        const filename = crypto.pseudoRandomBytes(16).toString("hex")
+        const extension = photoTypes[file.mimetype]
+        callback(null, `${filename}.${extension}`)
+    }
+  }),
+  fileFilter: (req, file, callback) => {
+    callback(null, !!photoTypes[file.mimetype]);
+  }
+});
 
 /*
  * POST /photos - Route to create a new photo.
  */
-router.post('/', async (req, res) => {
-  if (validateAgainstSchema(req.body, PhotoSchema)) {
+router.post('/', upload.single('photo'), async (req, res, next) => {
+  const body = JSON.parse(req.body.data)
+  if (validateAgainstSchema(body, PhotoSchema) && req.file) {
     try {
-      const id = await insertNewPhoto(req.body)
-      res.status(201).send({
+      const photo = {
+        contentType: req.file.mimetype,
+        filename: req.file.filename,
+        path: req.file.path,
+        userId: body.userId
+      }
+      const id = await savePhotoFile(photo)
+      const channel = getChannel();
+      channel.sendToQueue('photos', Buffer.from(id.toString()));
+      await removeUploadedFile(photo)
+      res.status(200).send({
         id: id,
         links: {
           photo: `/photos/${id}`,
-          business: `/businesses/${req.body.businessId}`
+          business: `/businesses/${body.businessId}`
         }
       })
     } catch (err) {
@@ -35,7 +64,7 @@ router.post('/', async (req, res) => {
     }
   } else {
     res.status(400).send({
-      error: "Request body is not a valid photo object"
+      error: "Request body is not a valid photo object, must include a userId, and businessId as well as be valid jpg or png file."
     })
   }
 })
@@ -45,9 +74,18 @@ router.post('/', async (req, res) => {
  */
 router.get('/:id', async (req, res, next) => {
   try {
-    const photo = await getPhotoById(req.params.id)
+    const photo = await getPhotoInfoById(req.params.id)
     if (photo) {
-      res.status(200).send(photo)
+      delete photo.path;
+      const resBody = {
+        _id: photo._id,
+        url: `/media/photos/${photo._id}.${photoTypes[photo.metadata.contentType]}`,
+        contentType: photo.metadata.contentType,
+        userId: photo.metadata.userId,
+        thumbId: photo.metadata.thumbId,
+        thumbUrl: `/media/thumbs/${photo._id}.jpg`
+      }
+      res.status(200).send(resBody)
     } else {
       next()
     }
